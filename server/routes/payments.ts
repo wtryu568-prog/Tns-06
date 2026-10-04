@@ -1,0 +1,599 @@
+/**
+ * Payments Routes
+ * /api/payments/submit, /api/payments/approve, /api/payments/reject, /api/payments/cancel, /api/payments/record-cash
+ */
+
+import { Router } from "express";
+import { z } from "zod";
+import { supabase } from "../config/supabase";
+import { convertKeysToCamel } from "../utils/camelCase";
+import { roundToTwoDecimals } from "../utils/math";
+import { createNotification } from "../services/notificationService";
+import { writeLog } from "../services/logService";
+import { updateBillStatus } from "../services/billService";
+import { extractAndSaveImage } from "../services/imageService";
+import { asyncHandler } from "../middleware/errorHandler";
+import { processAndMatchSlips } from "../services/slipScannerService";
+
+const router = Router();
+
+// Cancel payment
+router.post("/payments/cancel", asyncHandler(async (req, res) => {
+  const billId = req.body.billId || req.body.bill_id;
+  const userId = req.body.userId || req.body.user_id;
+
+  if (!billId) return res.status(400).json({ error: "กรุณาระบุรหัสบิลที่ต้องการยกเลิกคำขอค่ะ" });
+
+  let query = supabase.from("payments").select("*").eq("bill_id", billId).eq("status", "pending_review");
+  if (userId) {
+    query = query.eq("user_id", userId);
+  }
+  const { data: payments } = await query.limit(1);
+  const payment = payments && payments.length > 0 ? payments[0] : null;
+
+  if (!payment) return res.status(404).json({ error: "ไม่พบหลักฐานการชำระเงินที่อยู่ระหว่างรอตรวจสอบ" });
+
+  await supabase.from("payments").delete().eq("id", payment.id);
+  await updateBillStatus(billId);
+  await writeLog(userId || payment.user_id || "unknown", "cancel_payment_request", "payment", payment.id, { billId, amount: payment.amount });
+  res.json({ success: true, message: "ยกเลิกคำขอชำระเงินเรียบร้อยแล้ว" });
+}));
+
+// Submit payment slip with Zod validation
+router.post("/payments/submit", asyncHandler(async (req, res) => {
+  const paymentSchema = z.object({
+    billId: z.string().min(1, "กรุณาระบุรหัสบิลค่ะ"),
+    userId: z.string().min(1, "กรุณาระบุรหัสผู้ใช้งานค่ะ"),
+    amount: z.union([z.number(), z.string()]).transform((val) => Number(val)).refine((num) => !isNaN(num) && num > 0, {
+      message: "จำนวนเงินโอนต้องเป็นตัวเลขที่มากกว่า 0 บาทค่ะ"
+    }),
+    slipUrl: z.string().optional(),
+    note: z.string().max(250, "คำอธิบายมีความยาวเกินไป (สูงสุด 250 ตัวอักษร)").optional()
+  });
+
+  const parseResult = paymentSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    const firstError = parseResult.error.issues[0]?.message || "ข้อมูลส่งสลิปไม่ถูกต้องค่ะ";
+    return res.status(400).json({ error: firstError });
+  }
+
+  const { billId, userId, amount, slipUrl, note } = parseResult.data;
+  const numAmount = roundToTwoDecimals(amount);
+
+  const { data: existingPending } = await supabase.from("payments").select("id").eq("bill_id", billId).eq("user_id", userId).eq("status", "pending_review");
+  if (existingPending && existingPending.length > 0) return res.status(400).json({ error: "คุณมีรายการส่งสลิปสำหรับบิลนี้อยู่แล้วและกำลังรอการตรวจสอบจากเหรัญญิก" });
+
+  const { data: existingApproved } = await supabase.from("payments").select("id").eq("bill_id", billId).eq("user_id", userId).eq("status", "approved");
+  if (existingApproved && existingApproved.length > 0) return res.status(400).json({ error: "คุณได้ชำระเงินสำหรับบิลนี้และได้รับการอนุมัติเรียบร้อยแล้ว" });
+
+  let processedSlipUrl = slipUrl || "";
+  if (processedSlipUrl.startsWith("data:image/")) {
+    processedSlipUrl = await extractAndSaveImage(processedSlipUrl, "/api/payments/submit", { billId, userId });
+  }
+
+  const paymentId = `pay_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+  const newPayment = { id: paymentId, user_id: userId, bill_id: billId, amount: numAmount, slip_url: processedSlipUrl, status: "pending_review", note: note || "", created_at: new Date().toISOString() };
+  await supabase.from("payments").insert(newPayment);
+  await updateBillStatus(billId);
+
+  const { data: user } = await supabase.from("users").select("full_name").eq("id", userId).single();
+  const { data: treasurers } = await supabase.from("users").select("id, full_name").eq("role", "treasurer");
+  for (const t of (treasurers || [])) {
+    await createNotification(t.id, "มีสลิปใหม่รอการตรวจสอบ 💵", `คุณ ${user?.full_name || "สมาชิก"} ได้อัปโหลดสลิปสำหรับบิลเดือนนี้แล้ว กรุณาตรวจสอบและอนุมัติ`, "payment", paymentId, "payment");
+  }
+
+  await writeLog(userId, "submit_payment_slip", "payment", paymentId, { billId, amount: numAmount });
+  res.json({ success: true, payment: convertKeysToCamel(newPayment) });
+}));
+
+// Record cash payment with Zod validation
+router.post("/payments/record-cash", asyncHandler(async (req, res) => {
+  const cashRecordSchema = z.object({
+    billId: z.string().min(1, "กรุณาระบุรหัสบิลค่ะ"),
+    userId: z.string().min(1, "กรุณาระบุรหัสผู้ใช้งานค้างชำระค่ะ"),
+    amount: z.union([z.number(), z.string()]).transform((val) => Number(val)).refine((num) => !isNaN(num) && num > 0, {
+      message: "จำนวนเงินสดต้องเป็นตัวเลขที่มากกว่า 0 บาทค่ะ"
+    }),
+    treasurerId: z.string().min(1, "กรุณาระบุรหัสผู้บันทึกค่ะ"),
+    note: z.string().max(250, "คำอธิบายมีความยาวเกินไป (สูงสุด 250 ตัวอักษร)").optional()
+  });
+
+  const parseResult = cashRecordSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    const firstError = parseResult.error.issues[0]?.message || "ข้อมูลบันทึกเงินสดไม่ถูกต้องค่ะ";
+    return res.status(400).json({ error: firstError });
+  }
+
+  const { billId, userId, amount, treasurerId, note } = parseResult.data;
+  const numAmount = roundToTwoDecimals(amount);
+
+  // 1. Verify recorder identity & role
+  const { data: recorder } = await supabase.from("users").select("*").eq("id", treasurerId).single();
+  if (!recorder) {
+    return res.status(403).json({ error: "ไม่พบข้อมูลผู้บันทึกในระบบ" });
+  }
+
+  if (recorder.role !== "treasurer" && recorder.role !== "leader") {
+    return res.status(403).json({ error: "ไม่มีสิทธิ์ดำเนินการ (เฉพาะเหรัญญิกและหัวหน้าห้องเท่านั้นที่สามารถบันทึกเงินสดได้)" });
+  }
+
+  // 2. Prevent duplicate pending or approved payments for this bill
+  const { data: existingApproved } = await supabase.from("payments").select("id").eq("bill_id", billId).eq("user_id", userId).eq("status", "approved");
+  if (existingApproved && existingApproved.length > 0) {
+    return res.status(400).json({ error: "สมาชิกท่านนี้ได้ชำระบิลนี้และได้รับการอนุมัติเรียบร้อยแล้ว" });
+  }
+
+  const { data: existingPending } = await supabase.from("payments").select("id").eq("bill_id", billId).eq("user_id", userId).eq("status", "pending_review");
+  if (existingPending && existingPending.length > 0) {
+    return res.status(400).json({ error: "สมาชิกท่านนี้มีรายการชำระเงินที่อยู่ระหว่างรอการตรวจสอบอยู่แล้ว" });
+  }
+
+  // 3. Self-cash recording policy: Leaders cannot auto-approve, and Treasurers recording for themselves must enter review state to prevent fraud
+  const isLeader = recorder.role === "leader";
+  const isSelfRecording = treasurerId === userId;
+
+  const paymentId = `pay_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+  const { data: bill } = await supabase.from("monthly_bills").select("*").eq("id", billId).single();
+  const { data: user } = await supabase.from("users").select("*").eq("id", userId).single();
+
+  if (isLeader || isSelfRecording) {
+    const noteText = isSelfRecording 
+      ? (note || "แจ้งชำระด้วยเงินสด (ส่งเรื่องรอตรวจสอบ)")
+      : (note || "แจ้งชำระด้วยเงินสด (บันทึกโดยหัวหน้าห้อง)");
+
+    const newPayment = { 
+      id: paymentId, 
+      user_id: userId, 
+      bill_id: billId, 
+      amount: numAmount, 
+      slip_url: "cash", 
+      status: "pending_review", 
+      note: noteText, 
+      created_at: new Date().toISOString() 
+    };
+    await supabase.from("payments").insert(newPayment);
+    await updateBillStatus(billId);
+
+    const { data: treasurers } = await supabase.from("users").select("id").eq("role", "treasurer");
+    for (const t of (treasurers || [])) {
+      if (t.id !== treasurerId) {
+        await createNotification(t.id, "มีรายการชำระเงินสดรอการอนุมัติ 💵", `ผู้บันทึกคุณ ${recorder.full_name} ได้แจ้งรายการรับเงินสดจำนวน ${numAmount} บาท ของคุณ ${user?.full_name || "สมาชิก"}`, "payment", paymentId, "payment");
+      }
+    }
+    await createNotification(userId, "ส่งยอดชำระเงินสดแล้ว 💵", `การรับเงินสดจำนวน ${numAmount} บาท ถูกบันทึกเข้าระบบแล้ว (รอการตรวจสอบ)`, "payment", paymentId, "payment");
+    await writeLog(treasurerId, "record_cash_pending", "payment", paymentId, { studentId: user?.student_id, amount: numAmount });
+    return res.json({ success: true, payment: convertKeysToCamel(newPayment) });
+  }
+
+  // Treasurer recording for another user -> auto approve
+  const monthStr = bill ? String(bill.month).padStart(2, "0") : "00";
+  const yearStr = bill ? bill.year : "2569";
+  const suffix = user ? user.student_id.substring(4) : "0000";
+  const receiptNumber = `REC-${yearStr}-${monthStr}-${suffix}`;
+
+  const newPayment = { 
+    id: paymentId, 
+    user_id: userId, 
+    bill_id: billId, 
+    amount: numAmount, 
+    slip_url: "cash", 
+    status: "approved", 
+    note: note || "ชำระด้วยเงินสด (เหรัญญิกรับเงินและบันทึกอนุมัติด้วยตนเอง)", 
+    created_at: new Date().toISOString(), 
+    reviewed_by: treasurerId, 
+    reviewed_at: new Date().toISOString(), 
+    receipt_number: receiptNumber 
+  };
+  await supabase.from("payments").insert(newPayment);
+  await updateBillStatus(billId);
+
+  const txId = `tx_${Date.now()}`;
+  await supabase.from("transactions").insert({ 
+    id: txId, 
+    type: "income", 
+    category: "monthly_fee", 
+    amount: Number(amount), 
+    description: `ค่าบำรุงกองทุนรายเดือน (เงินสด) (${bill ? `${bill.month}/${bill.year}` : ""}) - ${user?.full_name || "นักศึกษา"}`, 
+    reference_id: paymentId, 
+    reference_type: "payment", 
+    created_by: treasurerId, 
+    approved_by: treasurerId, 
+    approved_at: new Date().toISOString(), 
+    month: bill ? bill.month : new Date().getMonth() + 1, 
+    year: bill ? bill.year : 2569, 
+    is_closed: false, 
+    created_at: new Date().toISOString() 
+  });
+
+  await createNotification(userId, "ชำระเงินสดเสร็จสิ้นแล้ว 🎉", `เหรัญญิกได้บันทึกการรับเงินสดจำนวน ${amount} บาท เลขใบเสร็จคือ ${receiptNumber}`, "payment", paymentId, "payment");
+  await writeLog(treasurerId, "record_cash_payment", "payment", paymentId, { studentId: user?.student_id, amount });
+  res.json({ success: true, payment: convertKeysToCamel(newPayment) });
+}));
+
+// Approve payment
+router.post("/payments/approve", asyncHandler(async (req, res) => {
+  const { paymentId, treasurerId, note } = req.body;
+  if (!paymentId || !treasurerId) return res.status(400).json({ error: "ข้อมูลไม่ครบถ้วนค่ะ" });
+
+  const { data: actingUser } = await supabase.from("users").select("role, classroom, full_name").eq("id", treasurerId).single();
+  if (!actingUser || (actingUser.role !== "treasurer" && actingUser.role !== "leader" && actingUser.role !== "president")) {
+    return res.status(403).json({ error: "ไม่มีสิทธิ์ดำเนินการ (เฉพาะเหรัญญิกและหัวหน้าห้องเท่านั้น)" });
+  }
+
+  const { data: payment } = await supabase.from("payments").select("*").eq("id", paymentId).single();
+  if (!payment) return res.status(404).json({ error: "ไม่พบรายการชำระเงินนี้" });
+  if (payment.status === "approved") return res.json({ success: true, payment: convertKeysToCamel(payment) });
+
+  const { data: user } = await supabase.from("users").select("*").eq("id", payment.user_id).single();
+  if (actingUser.role === "leader" && user?.classroom && user.classroom !== actingUser.classroom) {
+    return res.status(403).json({ error: "หัวหน้าห้องสามารถอนุมัติสลิปเฉพาะสมาชิกในห้องเรียนของตนเองเท่านั้นค่ะ" });
+  }
+
+  const { data: bill } = await supabase.from("monthly_bills").select("*").eq("id", payment.bill_id).single();
+
+  const monthStr = bill ? String(bill.month).padStart(2, "0") : "00";
+  const yearStr = bill ? bill.year : "2569";
+  const suffix = user ? user.student_id.substring(4) : "0000";
+  const receiptNumber = `REC-${yearStr}-${monthStr}-${suffix}`;
+
+  await supabase.from("payments").update({ status: "approved", reviewed_by: treasurerId, reviewed_at: new Date().toISOString(), note: note || payment.note, receipt_number: receiptNumber }).eq("id", paymentId);
+  if (bill) await updateBillStatus(bill.id);
+
+  const txId = `tx_${Date.now()}`;
+  await supabase.from("transactions").insert({ id: txId, type: "income", category: "monthly_fee", amount: payment.amount, description: `ค่าบำรุงกองทุนรายเดือน (${bill ? `${bill.month}/${bill.year}` : ""}) - ${user?.full_name || "นักศึกษา"}`, reference_id: payment.id, reference_type: "payment", created_by: treasurerId, approved_by: treasurerId, approved_at: new Date().toISOString(), month: bill ? bill.month : new Date().getMonth() + 1, year: bill ? bill.year : 2569, is_closed: false, created_at: new Date().toISOString() });
+
+  const reviewerTitle = actingUser.role === "leader" ? `หัวหน้าห้อง (${actingUser.full_name})` : "เหรัญญิก";
+  await createNotification(payment.user_id, "ชำระเงินกองทุนอนุมัติสำเร็จแล้ว 🎉", `${reviewerTitle}ตรวจสอบการชำระเงินเดือนนี้แล้ว ยอดเงิน ${payment.amount} บาท เลขใบเสร็จคือ ${receiptNumber}`, "payment", payment.id, "payment");
+  await writeLog(treasurerId, "approve_payment", "payment", paymentId, { studentId: user?.student_id, amount: payment.amount });
+
+  const { data: updated } = await supabase.from("payments").select("*").eq("id", paymentId).single();
+  res.json({ success: true, payment: convertKeysToCamel(updated) });
+}));
+
+// Reject payment
+router.post("/payments/reject", asyncHandler(async (req, res) => {
+  const { paymentId, treasurerId, rejectReason } = req.body;
+  if (!paymentId || !treasurerId || !rejectReason) return res.status(400).json({ error: "ข้อมูลไม่ครบถ้วนค่ะ" });
+
+  const { data: actingUser } = await supabase.from("users").select("role, classroom, full_name").eq("id", treasurerId).single();
+  if (!actingUser || (actingUser.role !== "treasurer" && actingUser.role !== "leader" && actingUser.role !== "president")) {
+    return res.status(403).json({ error: "ไม่มีสิทธิ์ดำเนินการ (เฉพาะเหรัญญิกและหัวหน้าห้องเท่านั้น)" });
+  }
+
+  const { data: payment } = await supabase.from("payments").select("*").eq("id", paymentId).single();
+  if (!payment) return res.status(404).json({ error: "ไม่พบรายการชำระเงินนี้" });
+
+  const { data: user } = await supabase.from("users").select("*").eq("id", payment.user_id).single();
+  if (actingUser.role === "leader" && user?.classroom && user.classroom !== actingUser.classroom) {
+    return res.status(403).json({ error: "หัวหน้าห้องสามารถปฏิเสธสลิปเฉพาะสมาชิกในห้องเรียนของตนเองเท่านั้นค่ะ" });
+  }
+
+  await supabase.from("payments").update({ status: "rejected", reviewed_by: treasurerId, reviewed_at: new Date().toISOString(), reject_reason: rejectReason }).eq("id", paymentId);
+
+  const { data: bill } = await supabase.from("monthly_bills").select("id").eq("id", payment.bill_id).single();
+  if (bill) await updateBillStatus(bill.id);
+
+  const reviewerTitle = actingUser.role === "leader" ? `หัวหน้าห้อง (${actingUser.full_name})` : "เหรัญญิก";
+  await createNotification(payment.user_id, "❌ คำขอชำระเงินกองทุนถูกปฏิเสธ", `รายการชำระเงินของคุณถูก${reviewerTitle}ปฏิเสธด้วยเหตุผล: "${rejectReason}"`, "payment", payment.id, "payment");
+  await writeLog(treasurerId, "reject_payment", "payment", paymentId, { studentId: user?.student_id, reason: rejectReason });
+
+  const { data: updated } = await supabase.from("payments").select("*").eq("id", paymentId).single();
+  res.json({ success: true, payment: convertKeysToCamel(updated) });
+}));
+
+// Admin/Treasurer/Committee upload slip later with Google Drive integration
+router.post("/payments/upload-slip-admin", asyncHandler(async (req, res) => {
+  const { billId, userId, base64Image, treasurerId, note } = req.body;
+  if (!billId || !userId || !base64Image || !treasurerId) {
+    return res.status(400).json({ error: "กรุณากรอกข้อมูลให้ครบถ้วนค่ะ (billId, userId, base64Image, treasurerId)" });
+  }
+
+  // Verify role (Restricted to treasurer/admin)
+  const { data: requester } = await supabase.from("users").select("role").eq("id", treasurerId).single();
+  if (!requester || requester.role !== "treasurer") {
+    return res.status(403).json({ error: "ไม่มีสิทธิ์ดำเนินการ (เฉพาะเหรัญญิกหลักเท่านั้น)" });
+  }
+
+  const { data: bill } = await supabase.from("monthly_bills").select("*").eq("id", billId).single();
+  if (!bill) return res.status(404).json({ error: "ไม่พบรอบบิลนี้ในระบบค่ะ" });
+
+  const { data: user } = await supabase.from("users").select("*").eq("id", userId).single();
+  if (!user) return res.status(404).json({ error: "ไม่พบข้อมูลสมาชิกในระบบค่ะ" });
+
+  // 1. Upload/extract slip image to Google Drive or local storage fallback
+  const slipUrl = await extractAndSaveImage(base64Image, "/api/payments/submit", { billId, userId });
+
+  // 2. Check if there is an existing payment record
+  const { data: existingPayments } = await supabase.from("payments").select("*").eq("bill_id", billId).eq("user_id", userId);
+  
+  const monthStr = String(bill.month).padStart(2, "0");
+  const yearStr = bill.year;
+  const suffix = user.student_id.substring(4);
+  const receiptNumber = `REC-${yearStr}-${monthStr}-${suffix}`;
+
+  let paymentId = `pay_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+  let paymentAmount = bill.amount;
+
+  if (existingPayments && existingPayments.length > 0) {
+    const existing = existingPayments[0];
+    paymentId = existing.id;
+    paymentAmount = existing.amount;
+
+    // Update existing payment
+    await supabase.from("payments").update({
+      slip_url: slipUrl,
+      status: "approved",
+      reviewed_by: treasurerId,
+      reviewed_at: new Date().toISOString(),
+      note: note || `เหรัญญิกแนบสลิปย้อนหลัง (เดิม: ${existing.note || "ไม่มี"})`,
+      receipt_number: receiptNumber
+    }).eq("id", paymentId);
+
+    // If it wasn't approved, insert a transaction
+    if (existing.status !== "approved") {
+      const { data: existingTx } = await supabase.from("transactions").select("id").eq("reference_id", paymentId).eq("reference_type", "payment");
+      if (!existingTx || existingTx.length === 0) {
+        const txId = `tx_${Date.now()}`;
+        await supabase.from("transactions").insert({
+          id: txId,
+          type: "income",
+          category: "monthly_fee",
+          amount: Number(paymentAmount),
+          description: `ค่าบำรุงกองทุนรายเดือน (${bill.month}/${bill.year}) - ${user.full_name}`,
+          reference_id: paymentId,
+          reference_type: "payment",
+          created_by: treasurerId,
+          approved_by: treasurerId,
+          approved_at: new Date().toISOString(),
+          month: bill.month,
+          year: bill.year,
+          is_closed: false,
+          created_at: new Date().toISOString()
+        });
+      }
+    }
+  } else {
+    // Create new approved payment
+    const newPayment = {
+      id: paymentId,
+      user_id: userId,
+      bill_id: billId,
+      amount: paymentAmount,
+      slip_url: slipUrl,
+      status: "approved",
+      note: note || "เหรัญญิกแนบสลิปย้อนหลัง",
+      created_at: new Date().toISOString(),
+      reviewed_by: treasurerId,
+      reviewed_at: new Date().toISOString(),
+      receipt_number: receiptNumber
+    };
+    await supabase.from("payments").insert(newPayment);
+
+    // Insert transaction
+    const txId = `tx_${Date.now()}`;
+    await supabase.from("transactions").insert({
+      id: txId,
+      type: "income",
+      category: "monthly_fee",
+      amount: Number(paymentAmount),
+      description: `ค่าบำรุงกองทุนรายเดือน (${bill.month}/${bill.year}) - ${user.full_name}`,
+      reference_id: paymentId,
+      reference_type: "payment",
+      created_by: treasurerId,
+      approved_by: treasurerId,
+      approved_at: new Date().toISOString(),
+      month: bill.month,
+      year: bill.year,
+      is_closed: false,
+      created_at: new Date().toISOString()
+    });
+  }
+
+  await updateBillStatus(billId);
+
+  await createNotification(userId, "แนบหลักฐานสลิปย้อนหลังเสร็จสิ้นแล้ว 🎉", `เหรัญญิกได้ทำการอัปโหลดหลักฐานสลิปย้อนหลังให้คุณ ยอดเงิน ${paymentAmount} บาท ใบเสร็จเลขที่ ${receiptNumber}`, "payment", paymentId, "payment");
+  await writeLog(treasurerId, "upload_slip_admin", "payment", paymentId, { studentId: user.student_id, amount: paymentAmount });
+
+  const { data: updatedPayment } = await supabase.from("payments").select("*").eq("id", paymentId).single();
+  res.json({ success: true, payment: convertKeysToCamel(updatedPayment) });
+}));
+
+// Scan multiple slip images and return student matching analysis
+router.post("/payments/scan-slips", asyncHandler(async (req, res) => {
+  const { slipImages, billId } = req.body;
+  if (!slipImages || !Array.isArray(slipImages) || slipImages.length === 0) {
+    return res.status(400).json({ error: "กรุณาส่งรูปสลิปอย่างน้อย 1 รูปค่ะ" });
+  }
+
+  const results = await processAndMatchSlips(slipImages, billId);
+  res.json({ success: true, results });
+}));
+
+// Bulk submit payments (supports autoApprove or pending_review)
+router.post("/payments/bulk-submit", asyncHandler(async (req, res) => {
+  const bulkSchema = z.object({
+    billId: z.string().min(1, "กรุณาระบุรหัสบิลค่ะ"),
+    treasurerId: z.string().min(1, "กรุณาระบุรหัสผู้บันทึกค่ะ"),
+    items: z.array(z.object({
+      userId: z.string().min(1, "กรุณาระบุสมาชิกค่ะ"),
+      amount: z.number().gt(0, "จำนวนเงินต้องมากกว่า 0"),
+      slipUrl: z.string().min(1, "กรุณาระบุไฟล์สลิปค่ะ"),
+      note: z.string().optional(),
+      autoApprove: z.boolean().optional()
+    })).min(1, "กรุณาระบุรายการสลิปอย่างน้อย 1 รายการค่ะ")
+  });
+
+  const parseResult = bulkSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    const firstError = parseResult.error.issues[0]?.message || "ข้อมูลนำเข้าสลิปไม่ถูกต้องค่ะ";
+    return res.status(400).json({ error: firstError });
+  }
+
+  const { billId, treasurerId, items } = parseResult.data;
+
+  // Verify actor permission
+  const { data: actor } = await supabase.from("users").select("role, full_name").eq("id", treasurerId).single();
+  if (!actor || (actor.role !== "treasurer" && actor.role !== "leader")) {
+    return res.status(403).json({ error: "ไม่มีสิทธิ์ดำเนินการ (เฉพาะเหรัญญิกและหัวหน้าห้องเท่านั้น)" });
+  }
+
+  const { data: bill } = await supabase.from("monthly_bills").select("*").eq("id", billId).single();
+  if (!bill) return res.status(404).json({ error: "ไม่พบบิลเดือนนี้ในระบบค่ะ" });
+
+  const processedPayments = [];
+  const errors = [];
+
+  for (const item of items) {
+    try {
+      const { userId, amount, slipUrl, note, autoApprove } = item;
+      const numAmount = roundToTwoDecimals(amount);
+
+      const { data: user } = await supabase.from("users").select("student_id, full_name").eq("id", userId).single();
+      if (!user) {
+        errors.push(`ไม่พบข้อมูลสมาชิก ID: ${userId}`);
+        continue;
+      }
+
+      // Check existing approved payment
+      const { data: existingApproved } = await supabase.from("payments").select("id").eq("bill_id", billId).eq("user_id", userId).eq("status", "approved");
+      if (existingApproved && existingApproved.length > 0) {
+        errors.push(`คุณ ${user.full_name} ได้รับการอนุมัติการชำระเงินของบิลนี้ไปแล้ว`);
+        continue;
+      }
+
+      // Save/extract image
+      let processedSlipUrl = slipUrl;
+      if (processedSlipUrl.startsWith("data:image/")) {
+        processedSlipUrl = await extractAndSaveImage(processedSlipUrl, "/api/payments/submit", { billId, userId });
+      }
+
+      const paymentId = `pay_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+      const monthStr = String(bill.month).padStart(2, "0");
+      const yearStr = bill.year;
+      const suffix = user.student_id ? user.student_id.substring(4) : "0000";
+      const receiptNumber = `REC-${yearStr}-${monthStr}-${suffix}`;
+
+      const isApproved = Boolean(autoApprove);
+
+      const newPayment = {
+        id: paymentId,
+        user_id: userId,
+        bill_id: billId,
+        amount: numAmount,
+        slip_url: processedSlipUrl,
+        status: isApproved ? "approved" : "pending_review",
+        note: note || (isApproved ? "นำเข้าสลิปรวมและอนุมัติโดยเหรัญญิก" : "นำเข้าสลิปรวม (รอเหรัญญิกตรวจสอบอนุมัติ)"),
+        created_at: new Date().toISOString(),
+        ...(isApproved ? {
+          reviewed_by: treasurerId,
+          reviewed_at: new Date().toISOString(),
+          receipt_number: receiptNumber
+        } : {})
+      };
+
+      await supabase.from("payments").insert(newPayment);
+
+      if (isApproved) {
+        // Create transaction
+        const txId = `tx_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`;
+        await supabase.from("transactions").insert({
+          id: txId,
+          type: "income",
+          category: "monthly_fee",
+          amount: numAmount,
+          description: `ค่าบำรุงกองทุนรายเดือน (${bill.month}/${bill.year}) - ${user.full_name}`,
+          reference_id: paymentId,
+          reference_type: "payment",
+          created_by: treasurerId,
+          approved_by: treasurerId,
+          approved_at: new Date().toISOString(),
+          month: bill.month,
+          year: bill.year,
+          is_closed: false,
+          created_at: new Date().toISOString()
+        });
+
+        await createNotification(userId, "ชำระเงินกองทุนอนุมัติสำเร็จแล้ว 🎉", `เหรัญญิกได้บันทึกการชำระเงินจากสลิปรวม ยอดเงิน ${numAmount} บาท เลขใบเสร็จคือ ${receiptNumber}`, "payment", paymentId, "payment");
+      } else {
+        await createNotification(userId, "มีสลิปใหม่รอการตรวจสอบ 💵", `เหรัญญิก/หัวหน้าห้องได้นำเข้าสลิปชำระเงินของคุณจำนวน ${numAmount} บาทแล้ว (กำลังรอเหรัญญิกตรวจสอบอนุมัติ)`, "payment", paymentId, "payment");
+      }
+
+      processedPayments.push(convertKeysToCamel(newPayment));
+    } catch (err: any) {
+      console.error("[Bulk Submit Item Error]:", err);
+      errors.push(err.message || "เกิดข้อผิดพลาดในการบันทึกรายการ");
+    }
+  }
+
+  await updateBillStatus(billId);
+  await writeLog(treasurerId, "bulk_submit_payments", "payment", billId, { totalCount: items.length, successCount: processedPayments.length });
+
+  res.json({
+    success: true,
+    processedPayments,
+    errors,
+    message: `นำเข้าสลิปสำเร็จ ${processedPayments.length} รายการ จากทั้งหมด ${items.length} รายการ`
+  });
+}));
+
+// Send reminder notification to unpaid members in a classroom or system-wide
+router.post("/payments/remind-unpaid", asyncHandler(async (req, res) => {
+  const { billId, classroom, senderId } = req.body;
+  if (!senderId) {
+    return res.status(400).json({ error: "กรุณาระบุผู้ส่งการแจ้งเตือนค่ะ" });
+  }
+
+  const { data: sender } = await supabase.from("users").select("role, full_name, classroom").eq("id", senderId).single();
+  if (!sender || (sender.role !== "treasurer" && sender.role !== "leader" && sender.role !== "president")) {
+    return res.status(403).json({ error: "เฉพาะเหรัญญิกและหัวหน้าห้องเท่านั้นที่สามารถส่งการแจ้งเตือนทวงเงินได้ค่ะ" });
+  }
+
+  const targetClassroom = classroom || (sender.role === "leader" ? sender.classroom : null);
+
+  let targetMonth = new Date().getMonth() + 1;
+  let targetYear = new Date().getFullYear() + 543;
+  let amount = 150;
+
+  if (billId) {
+    const { data: bill } = await supabase.from("monthly_bills").select("month, year, amount").eq("id", billId).single();
+    if (bill) {
+      targetMonth = bill.month;
+      targetYear = bill.year;
+      amount = bill.amount;
+    }
+  }
+
+  let userQuery = supabase.from("users").select("id, full_name, classroom").eq("is_active", true);
+  if (targetClassroom) {
+    userQuery = userQuery.eq("classroom", targetClassroom);
+  }
+  const { data: targetUsers } = await userQuery;
+
+  const { data: billsInCycle } = await supabase.from("monthly_bills").select("id, user_id, status").eq("month", targetMonth).eq("year", targetYear);
+  
+  const pendingUserIds = new Set(
+    (billsInCycle || [])
+      .filter((b: any) => b.status === "pending" || b.status === "pending_review")
+      .map((b: any) => b.user_id)
+  );
+
+  let remindedCount = 0;
+  for (const u of (targetUsers || [])) {
+    if (pendingUserIds.has(u.id)) {
+      await createNotification(
+        u.id,
+        "🔔 แจ้งเตือนชำระค่าบำรุงกองทุนประจำเดือน",
+        `สวัสดีคุณ ${u.full_name}, ${sender.full_name} (${sender.role === "leader" ? `หัวหน้าห้อง ${sender.classroom}` : "เหรัญญิก"}) ขอแจ้งเตือนการชำระค่าบำรุงกองทุนประจำเดือน ${targetMonth}/${targetYear} จำนวน ${amount} บาท กรุณาชำระและแนบสลิปผ่านระบบค่ะ`,
+        "bill",
+        billId || `bill_${u.id}`,
+        "bill"
+      );
+      remindedCount++;
+    }
+  }
+
+  await writeLog(senderId, "remind_unpaid_members", "payments", billId || "current_cycle", { targetClassroom, remindedCount });
+  res.json({ success: true, remindedCount, message: `ส่งแจ้งเตือนไปยังสมาชิกค้างชำระเรียบร้อยแล้วจำนวน ${remindedCount} ท่าน` });
+}));
+
+export default router;
